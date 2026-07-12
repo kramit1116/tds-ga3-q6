@@ -1,6 +1,4 @@
-fastapi 
-uvicorn 
-python-multipart 
-pandas 
-numpy
-openai-whisper
+fastapi
+uvicorn
+httpx
+python-multipart
