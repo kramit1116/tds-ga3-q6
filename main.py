@@ -31,16 +31,88 @@ HEAD = {
 
 _CACHE = {}
 
-def _ck(*parts):
-    return hashlib.sha256(
-        "||".join(map(str, parts)).encode()
-    ).hexdigest()
-    
+
 last_debug_info = {}
 last_audio_bytes = b""          # raw audio the grader last sent (for download)
 last_audio_mime = "audio/wav"
 
 audio_history = []      # every Q6 call this session: transcript + extraction + result
+
+
+
+_CACHE = {}
+def _ck(*parts):
+    return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
+import asyncio
+async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
+    key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
+    if key in _CACHE:
+        return _CACHE[key]
+    body = {"model": model or config.TEXT_MODEL, "messages": messages,
+            "temperature": 0, "max_tokens": max_tokens}
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+    last_err = None
+    async with httpx.AsyncClient(timeout=90) as c:
+        for attempt in range(retries):
+            r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
+                             headers=HEAD, json=body)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
+                continue
+            r.raise_for_status()
+            out = r.json()["choices"][0]["message"]["content"]
+            _CACHE[key] = out
+            return out
+    raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
+# Gemini models to try in order for audio transcription. If one is overloaded (503)
+# or rate-limited (429), we retry it, then fall through to the next.
+GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
+                 "gemini-flash-latest"]
+
+async def gemini_transcribe(payload, attempts_per_model=3):
+    global last_debug_info
+    last_err = ""
+    async with httpx.AsyncClient(timeout=120) as c:
+        for model in GEMINI_MODELS:
+            for attempt in range(attempts_per_model):
+                try:
+                    r = await c.post(
+                        f"https://aipipe.org/geminiv1beta/models/{model}:generateContent",
+                        headers={"Authorization": f"Bearer {config.AIPIPE_TOKEN}"},
+                        json=payload)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        last_err = f"HTTP {r.status_code} on {model}: {r.text[:160]}"
+                        await asyncio.sleep(1.5 * (attempt + 1))   # backoff
+                        continue
+                    r.raise_for_status()
+                    data = r.json()
+                    txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    last_debug_info["transcribe_model"] = model
+                    return txt
+                except (KeyError, IndexError):
+                    last_err = f"empty candidates on {model}"
+                    break   # model answered but no text -> try next model
+                except Exception as e:
+                    last_err = f"{type(e).__name__} on {model}: {str(e)[:160]}"
+                    await asyncio.sleep(1.0 * (attempt + 1))
+    last_debug_info["transcribe_error"] = last_err
+    return ""
+
+def parse_json(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+@app.get("/")
+async def root():
+    return {"ok": True, "email": config.EMAIL}
+
 
 @app.get("/debug")
 def get_debug():
