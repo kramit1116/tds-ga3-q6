@@ -293,6 +293,14 @@ async def answer_audio(request: Request):
             for k in sd:
                 if k not in referenced:
                     referenced.append(k)
+        elif isinstance(sd, list):
+            # e.g. correlation: [{"x": "키", "y": "몸무게", "type": "positive"}, ...]
+            for item in sd:
+                if isinstance(item, dict):
+                    for kk in ("x", "y"):
+                        v = item.get(kk)
+                        if v and v not in referenced:
+                            referenced.append(v)
     for c in referenced:
         if c not in columns:
             columns.append(c)
